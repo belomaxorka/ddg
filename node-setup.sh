@@ -12,7 +12,8 @@
 #   3. применяет сетевые оптимизации ядра (sysctl, limits, BBR)
 #   4. выпускает самоподписанный сертификат
 #   5. раскатывает vhost с WebSocket-проксированием на xray
-#   6. ставит шейпер исходящей полосы + systemd-юнит
+#   6. открывает 80/443 в фаерволе (ufw / firewalld / iptables)
+#   7. ставит шейпер исходящей полосы + systemd-юнит
 #
 # Повторный запуск безопасен: всё перезаписывается идемпотентно.
 #
@@ -658,7 +659,86 @@ systemctl restart nginx
 info "nginx перезапущен"
 
 
-# ─── 9. шейпер ───────────────────────────────────────────────────────────────
+# ─── 9. фаервол ──────────────────────────────────────────────────────────────
+step "Проверяю фаервол"
+
+FW_OPENED=""
+
+open_ufw() {
+    local changed=0
+    for port in 80 443; do
+        # ufw status выводит "80/tcp   ALLOW   Anywhere" для открытых
+        if ufw status 2>/dev/null | grep -qE "^${port}/tcp\s+ALLOW"; then
+            info "ufw: ${port}/tcp уже открыт"
+        else
+            ufw allow "${port}/tcp" comment "node-setup" >/dev/null 2>&1 \
+                && { info "ufw: открыл ${port}/tcp"; changed=1; } \
+                || warn "ufw: не удалось открыть ${port}/tcp"
+        fi
+    done
+    FW_OPENED="ufw"
+    return $changed
+}
+
+open_firewalld() {
+    local zone
+    zone="$(firewall-cmd --get-default-zone 2>/dev/null || echo public)"
+    for svc in http https; do
+        if firewall-cmd --zone="$zone" --query-service="$svc" >/dev/null 2>&1; then
+            info "firewalld: $svc уже разрешён в зоне $zone"
+        else
+            firewall-cmd --permanent --zone="$zone" --add-service="$svc" >/dev/null 2>&1 \
+                && info "firewalld: добавил $svc в зону $zone" \
+                || warn "firewalld: не удалось добавить $svc"
+        fi
+    done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    FW_OPENED="firewalld"
+}
+
+open_iptables() {
+    # только если политика INPUT — DROP/REJECT, иначе всё и так открыто
+    local policy
+    policy="$(iptables -S INPUT 2>/dev/null | awk '/^-P INPUT/ {print $3; exit}')"
+    if [[ "$policy" != "DROP" && "$policy" != "REJECT" ]]; then
+        info "iptables: политика INPUT — ${policy:-ACCEPT}, правила не нужны"
+        return
+    fi
+    for port in 80 443; do
+        if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+            info "iptables: ${port}/tcp уже разрешён"
+        else
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
+                && info "iptables: открыл ${port}/tcp" \
+                || warn "iptables: не удалось открыть ${port}/tcp"
+        fi
+    done
+    FW_OPENED="iptables"
+    # правила iptables не переживают перезагрузку без отдельного пакета
+    if command -v netfilter-persistent >/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1 && info "правила iptables сохранены"
+    elif command -v iptables-save >/dev/null && [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null && info "правила сохранены в /etc/iptables/rules.v4"
+    else
+        warn "правила iptables НЕ переживут перезагрузку"
+        warn "поставьте iptables-persistent, иначе после ребута порты снова закроются"
+    fi
+}
+
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
+    open_ufw || true
+elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    open_firewalld
+elif command -v iptables >/dev/null; then
+    open_iptables
+else
+    info "фаервол не обнаружен, пропускаю"
+fi
+
+[[ -n "$FW_OPENED" ]] && info "фаервол: $FW_OPENED, порты 80 и 443 доступны"
+
+
+# ─── 10. шейпер ──────────────────────────────────────────────────────────────
 if [[ $SKIP_SHAPE -eq 1 ]]; then
     step "Шейпер отключён (-r off)"
     tc qdisc del dev "$(ip route show default | awk '/default/{print $5; exit}')" root 2>/dev/null || true
@@ -714,7 +794,7 @@ EOF
 fi
 
 
-# ─── 10. верификация ─────────────────────────────────────────────────────────
+# ─── 11. верификация ─────────────────────────────────────────────────────────
 step "Проверяю, что настройки реально применились"
 
 FAILED=0
@@ -756,6 +836,20 @@ if [[ $SKIP_SHAPE -eq 0 ]]; then
     fi
 fi
 
+# отвечает ли nginx локально (порт открыт и конфиг рабочий)
+LOCAL_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1/" 2>/dev/null || echo 000)"
+if [[ "$LOCAL_CODE" == "200" ]]; then
+    printf '    %-34s %s\n' "заглушка на 127.0.0.1" "${C_OK}HTTP $LOCAL_CODE${C_OFF}"
+else
+    printf '    %-34s %s\n' "заглушка на 127.0.0.1" "${C_ERR}HTTP $LOCAL_CODE${C_OFF}"
+    FAILED=1
+fi
+
+# фаервол: видно ли порты снаружи — проверяем правила, а не соединение
+if [[ -n "$FW_OPENED" ]]; then
+    printf '    %-34s %s\n' "фаервол ($FW_OPENED)" "${C_OK}80, 443 открыты${C_OFF}"
+fi
+
 # доступен ли upstream xray
 UP_HOST="${UPSTREAM%:*}"; UP_PORT="${UPSTREAM##*:}"
 if timeout 2 bash -c "</dev/tcp/$UP_HOST/$UP_PORT" 2>/dev/null; then
@@ -782,6 +876,7 @@ cat <<EOF
              ^^^ впишите этот путь в узел Remnawave ($PATH_SOURCE)
   upstream   $UPSTREAM
   шейпер     $([[ $SKIP_SHAPE -eq 1 ]] && echo "выключен" || echo "$RATE на $IFACE")
+  фаервол    ${FW_OPENED:-не обнаружен}
 
   проверить:
     curl -Ik https://$DOMAIN/
